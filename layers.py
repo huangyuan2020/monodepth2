@@ -180,7 +180,7 @@ class Project3D(nn.Module):
         self.eps = eps
 
     def forward(self, points, K, T):
-        P = torch.matmul(K, T)[:, :3, :]
+        P = torch.matmul(K, T)[:, :, :]
 
         cam_points = torch.matmul(P, points)
 

@@ -46,7 +46,7 @@ class MonoDataset(data.Dataset):
                  frame_idxs,
                  num_scales,
                  is_train=False,
-                 img_ext='.jpg'):
+                 img_ext='.png'):
         super(MonoDataset, self).__init__()
 
         self.data_path = data_path
@@ -138,27 +138,17 @@ class MonoDataset(data.Dataset):
         inputs = {}
 
         do_color_aug = self.is_train and random.random() > 0.5
-        do_flip = self.is_train and random.random() > 0.5
 
-        line = self.filenames[index].split()
+        line = self.filenames[index].replace('\n', '').replace('\r', '').split()
         folder = line[0]
-
-        if len(line) == 3:
-            frame_index = int(line[1])
-        else:
-            frame_index = 0
-
-        if len(line) == 3:
-            side = line[2]
-        else:
-            side = None
-
+        frame_index = int(line[1])
+        inputs["frame"] = frame_index
         for i in self.frame_idxs:
-            if i == "s":
-                other_side = {"r": "l", "l": "r"}[side]
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index, other_side, do_flip)
-            else:
-                inputs[("color", i, -1)] = self.get_color(folder, frame_index + i, side, do_flip)
+            inputs[("color", i, -1)] = self.get_color(folder, frame_index + i)
+            inputs[("T", i)] = self.get_gt_pose(folder, frame_index + i)
+
+        inputs["depth_gt"] = self.get_depth(folder, frame_index)
+
 
         # adjusting intrinsics to match each scale in the pyramid
         for scale in range(self.num_scales):
@@ -184,19 +174,6 @@ class MonoDataset(data.Dataset):
             del inputs[("color", i, -1)]
             del inputs[("color_aug", i, -1)]
 
-        if self.load_depth:
-            depth_gt = self.get_depth(folder, frame_index, side, do_flip)
-            inputs["depth_gt"] = np.expand_dims(depth_gt, 0)
-            inputs["depth_gt"] = torch.from_numpy(inputs["depth_gt"].astype(np.float32))
-
-        if "s" in self.frame_idxs:
-            stereo_T = np.eye(4, dtype=np.float32)
-            baseline_sign = -1 if do_flip else 1
-            side_sign = -1 if side == "l" else 1
-            stereo_T[0, 3] = side_sign * baseline_sign * 0.1
-
-            inputs["stereo_T"] = torch.from_numpy(stereo_T)
-
         return inputs
 
     def get_color(self, folder, frame_index, side, do_flip):
@@ -206,4 +183,7 @@ class MonoDataset(data.Dataset):
         raise NotImplementedError
 
     def get_depth(self, folder, frame_index, side, do_flip):
+        raise NotImplementedError
+
+    def get_gt_pose(self, folder, frame_index):
         raise NotImplementedError

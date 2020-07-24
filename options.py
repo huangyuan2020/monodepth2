@@ -20,11 +20,13 @@ class MonodepthOptions:
         self.parser.add_argument("--data_path",
                                  type=str,
                                  help="path to the training data",
-                                 default=os.path.join(file_dir, "kitti_data"))
+                                 default="/mnt/beegfs/data/interiornet_dataset/",
+                                 #default=r"H:/Indoordataset/interior/"
+                                 )
         self.parser.add_argument("--log_dir",
                                  type=str,
                                  help="log directory",
-                                 default=os.path.join(os.path.expanduser("~"), "tmp"))
+                                 default="./logs/")
 
         # TRAINING options
         self.parser.add_argument("--model_name",
@@ -34,8 +36,8 @@ class MonodepthOptions:
         self.parser.add_argument("--split",
                                  type=str,
                                  help="which training split to use",
-                                 choices=["eigen_zhou", "eigen_full", "odom", "benchmark"],
-                                 default="eigen_zhou")
+                                 choices=["eigen_zhou", "eigen_full", "odom", "benchmark", "interior"],
+                                 default="interior")
         self.parser.add_argument("--num_layers",
                                  type=int,
                                  help="number of resnet layers",
@@ -44,15 +46,15 @@ class MonodepthOptions:
         self.parser.add_argument("--dataset",
                                  type=str,
                                  help="dataset to train on",
-                                 default="kitti",
-                                 choices=["kitti", "kitti_odom", "kitti_depth", "kitti_test"])
+                                 default="interior",
+                                 choices=["kitti", "kitti_odom", "kitti_depth", "kitti_test", "interior"])
         self.parser.add_argument("--png",
                                  help="if set, trains from raw KITTI png files (instead of jpgs)",
                                  action="store_true")
         self.parser.add_argument("--height",
                                  type=int,
                                  help="input image height",
-                                 default=192)
+                                 default=480)
         self.parser.add_argument("--width",
                                  type=int,
                                  help="input image width",
@@ -69,11 +71,11 @@ class MonodepthOptions:
         self.parser.add_argument("--min_depth",
                                  type=float,
                                  help="minimum depth",
-                                 default=0.1)
+                                 default=0.01)
         self.parser.add_argument("--max_depth",
                                  type=float,
                                  help="maximum depth",
-                                 default=100.0)
+                                 default=20.0)
         self.parser.add_argument("--use_stereo",
                                  help="if set, uses stereo pair for training",
                                  action="store_true")
@@ -87,7 +89,7 @@ class MonodepthOptions:
         self.parser.add_argument("--batch_size",
                                  type=int,
                                  help="batch size",
-                                 default=12)
+                                 default=1)
         self.parser.add_argument("--learning_rate",
                                  type=float,
                                  help="learning rate",
@@ -140,7 +142,7 @@ class MonodepthOptions:
         self.parser.add_argument("--num_workers",
                                  type=int,
                                  help="number of dataloader workers",
-                                 default=12)
+                                 default=0)
 
         # LOADING options
         self.parser.add_argument("--load_weights_folder",

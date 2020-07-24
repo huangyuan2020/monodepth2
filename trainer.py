@@ -111,15 +111,13 @@ class Trainer:
         print("Training is using:\n  ", self.device)
 
         # data
-        datasets_dict = {"kitti": datasets.KITTIRAWDataset,
-                         "kitti_odom": datasets.KITTIOdomDataset}
-        self.dataset = datasets_dict[self.opt.dataset]
+        self.dataset = datasets.InteriorDataset
 
         fpath = os.path.join(os.path.dirname(__file__), "splits", self.opt.split, "{}_files.txt")
 
         train_filenames = readlines(fpath.format("train"))
         val_filenames = readlines(fpath.format("val"))
-        img_ext = '.png' if self.opt.png else '.jpg'
+        img_ext = '.png'
 
         num_train_samples = len(train_filenames)
         self.num_total_steps = num_train_samples // self.opt.batch_size * self.opt.num_epochs
@@ -202,10 +200,10 @@ class Trainer:
 
             before_op_time = time.time()
 
-            outputs, losses = self.process_batch(inputs)
+            outputs, gt_outputs, losses, gt_losses = self.process_batch(inputs)
 
             self.model_optimizer.zero_grad()
-            losses["loss"].backward()
+            losses["gt_loss"].backward()
             self.model_optimizer.step()
 
             duration = time.time() - before_op_time
@@ -215,12 +213,12 @@ class Trainer:
             late_phase = self.step % 2000 == 0
 
             if early_phase or late_phase:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
+                self.log_time(batch_idx, duration, losses["loss"].cpu().data, losses["gt_loss"].cpu().data)
 
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
 
-                self.log("train", inputs, outputs, losses)
+                self.log("train", inputs, outputs, losses, gt_outputs)
                 self.val()
 
             self.step += 1
@@ -254,10 +252,10 @@ class Trainer:
         if self.use_pose_net:
             outputs.update(self.predict_poses(inputs, features))
 
-        self.generate_images_pred(inputs, outputs)
-        losses = self.compute_losses(inputs, outputs)
+        gt_outputs = self.generate_images_pred(inputs, outputs)
+        losses, gt_losses = self.compute_losses(inputs, outputs, gt_outputs)
 
-        return outputs, losses
+        return outputs, gt_outputs, losses, gt_losses
 
     def predict_poses(self, inputs, features):
         """Predict poses between input frames for monocular sequences.
@@ -328,13 +326,13 @@ class Trainer:
             inputs = self.val_iter.next()
 
         with torch.no_grad():
-            outputs, losses = self.process_batch(inputs)
+            outputs, gt_outputs, losses, gt_losses = self.process_batch(inputs)
 
             if "depth_gt" in inputs:
                 self.compute_depth_losses(inputs, outputs, losses)
 
-            self.log("val", inputs, outputs, losses)
-            del inputs, outputs, losses
+            self.log("val",  inputs, outputs, losses, gt_outputs)
+            del inputs, outputs, losses, gt_outputs
 
         self.set_train()
 
@@ -342,6 +340,7 @@ class Trainer:
         """Generate the warped (reprojected) color images for a minibatch.
         Generated images are saved into the `outputs` dictionary.
         """
+        gt_outputs = {}
         for scale in self.opt.scales:
             disp = outputs[("disp", scale)]
             if self.opt.v1_multiscale:
@@ -361,6 +360,7 @@ class Trainer:
                     T = inputs["stereo_T"]
                 else:
                     T = outputs[("cam_T_cam", 0, frame_id)]
+                    gtT = self.get_relative_translation(inputs, frame_id)
 
                 # from the authors of https://arxiv.org/abs/1712.00175
                 if self.opt.pose_model_type == "posecnn":
@@ -379,16 +379,33 @@ class Trainer:
                 pix_coords = self.project_3d[source_scale](
                     cam_points, inputs[("K", source_scale)], T)
 
+                gt_pix_coords = self.project_3d[source_scale](
+                    cam_points, inputs[("K", source_scale)], gtT)
+
                 outputs[("sample", frame_id, scale)] = pix_coords
+                gt_outputs[("gt_sample", frame_id, scale)] = gt_pix_coords
 
                 outputs[("color", frame_id, scale)] = F.grid_sample(
                     inputs[("color", frame_id, source_scale)],
                     outputs[("sample", frame_id, scale)],
-                    padding_mode="border")
+                    padding_mode="border", align_corners=False)
+
+                gt_outputs[("color", frame_id, scale)] = F.grid_sample(
+                    inputs[("color", frame_id, source_scale)],
+                    gt_outputs[("gt_sample", frame_id, scale)],
+                    padding_mode="border", align_corners=False)
 
                 if not self.opt.disable_automasking:
                     outputs[("color_identity", frame_id, scale)] = \
                         inputs[("color", frame_id, source_scale)]
+        return gt_outputs
+
+    def get_relative_translation(self, inputs, frame_id):
+        T1 = inputs[("T", 0)]
+        T2 = inputs[("T", frame_id)]
+        T1_inverse = torch.inverse(T1)
+        T21 = torch.matmul(T2, T1_inverse)
+        return T21
 
     def compute_reprojection_loss(self, pred, target):
         """Computes reprojection loss between a batch of predicted and target images
@@ -404,15 +421,19 @@ class Trainer:
 
         return reprojection_loss
 
-    def compute_losses(self, inputs, outputs):
+    def compute_losses(self, inputs, outputs, gt_outputs):
         """Compute the reprojection and smoothness losses for a minibatch
         """
         losses = {}
         total_loss = 0
+        gt_losses = {}
+        gt_total_loss = 0
 
         for scale in self.opt.scales:
             loss = 0
+            gt_loss = 0
             reprojection_losses = []
+            gt_reprojection_losses = []
 
             if self.opt.v1_multiscale:
                 source_scale = scale
@@ -425,9 +446,12 @@ class Trainer:
 
             for frame_id in self.opt.frame_ids[1:]:
                 pred = outputs[("color", frame_id, scale)]
+                gt = gt_outputs[("color", frame_id, scale)]
                 reprojection_losses.append(self.compute_reprojection_loss(pred, target))
+                gt_reprojection_losses.append(self.compute_reprojection_loss(gt, target))
 
             reprojection_losses = torch.cat(reprojection_losses, 1)
+            gt_reprojection_losses = torch.cat(gt_reprojection_losses, 1)
 
             if not self.opt.disable_automasking:
                 identity_reprojection_losses = []
@@ -457,11 +481,13 @@ class Trainer:
                 # add a loss pushing mask to 1 (using nn.BCELoss for stability)
                 weighting_loss = 0.2 * nn.BCELoss()(mask, torch.ones(mask.shape).cuda())
                 loss += weighting_loss.mean()
+                gt_loss += weighting_loss.mean()
 
             if self.opt.avg_reprojection:
                 reprojection_loss = reprojection_losses.mean(1, keepdim=True)
             else:
                 reprojection_loss = reprojection_losses
+                gt_reprojection_loss = gt_reprojection_losses
 
             if not self.opt.disable_automasking:
                 # add random numbers to break ties
@@ -469,31 +495,43 @@ class Trainer:
                     identity_reprojection_loss.shape).cuda() * 0.00001
 
                 combined = torch.cat((identity_reprojection_loss, reprojection_loss), dim=1)
+                gt_combined = torch.cat((identity_reprojection_loss, gt_reprojection_loss), dim=1)
             else:
                 combined = reprojection_loss
 
             if combined.shape[1] == 1:
                 to_optimise = combined
+                gt_to_optimise = gt_combined
             else:
                 to_optimise, idxs = torch.min(combined, dim=1)
+                gt_to_optimise, idxs = torch.min(gt_combined, dim=1)
 
             if not self.opt.disable_automasking:
                 outputs["identity_selection/{}".format(scale)] = (
                     idxs > identity_reprojection_loss.shape[1] - 1).float()
 
             loss += to_optimise.mean()
+            gt_loss += gt_to_optimise.mean()
 
             mean_disp = disp.mean(2, True).mean(3, True)
             norm_disp = disp / (mean_disp + 1e-7)
             smooth_loss = get_smooth_loss(norm_disp, color)
 
             loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
+            gt_loss += self.opt.disparity_smoothness * smooth_loss / (2 ** scale)
             total_loss += loss
+            gt_total_loss += gt_loss
             losses["loss/{}".format(scale)] = loss
+            losses["gt_loss/{}".format(scale)] = gt_loss
+            gt_losses["gt_loss/{}".format(scale)] = gt_loss
 
         total_loss /= self.num_scales
+        gt_total_loss /= self.num_scales
         losses["loss"] = total_loss
-        return losses
+        # losses["gt_loss"] for backward, gt_losses["gt_loss"] for record
+        losses["gt_loss"] = gt_total_loss
+        gt_losses["gt_loss"] = gt_total_loss
+        return losses, gt_losses
 
     def compute_depth_losses(self, inputs, outputs, losses):
         """Compute depth metrics, to allow monitoring during training
@@ -503,16 +541,16 @@ class Trainer:
         """
         depth_pred = outputs[("depth", 0, 0)]
         depth_pred = torch.clamp(F.interpolate(
-            depth_pred, [375, 1242], mode="bilinear", align_corners=False), 1e-3, 80)
+            depth_pred, [480, 640], mode="bilinear", align_corners=False), 1e-3, 80)
         depth_pred = depth_pred.detach()
 
         depth_gt = inputs["depth_gt"]
         mask = depth_gt > 0
 
         # garg/eigen crop
-        crop_mask = torch.zeros_like(mask)
-        crop_mask[:, :, 153:371, 44:1197] = 1
-        mask = mask * crop_mask
+        #crop_mask = torch.zeros_like(mask)
+        #crop_mask[:, :, 153:371, 44:1197] = 1
+        #mask = mask * crop_mask
 
         depth_gt = depth_gt[mask]
         depth_pred = depth_pred[mask]
@@ -525,7 +563,7 @@ class Trainer:
         for i, metric in enumerate(self.depth_metric_names):
             losses[metric] = np.array(depth_errors[i].cpu())
 
-    def log_time(self, batch_idx, duration, loss):
+    def log_time(self, batch_idx, duration, loss, gt_loss):
         """Print a logging statement to the terminal
         """
         samples_per_sec = self.opt.batch_size / duration
@@ -533,16 +571,18 @@ class Trainer:
         training_time_left = (
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
         print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-            " | loss: {:.5f} | time elapsed: {} | time left: {}"
-        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
+            " | loss: {:.5f} | gt_loss: {:.5f} | time elapsed: {} | time left: {}"
+        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss, gt_loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
-    def log(self, mode, inputs, outputs, losses):
+    def log(self, mode, inputs, outputs, losses, gt_outputs):
         """Write an event to the tensorboard events file
         """
         writer = self.writers[mode]
+        count = 0
         for l, v in losses.items():
-            writer.add_scalar("{}".format(l), v, self.step)
+            if v.squeeze().ndim == 0:
+                writer.add_scalar("{}".format(l), v, self.step)
 
         for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
             for s in self.opt.scales:
@@ -554,6 +594,9 @@ class Trainer:
                         writer.add_image(
                             "color_pred_{}_{}/{}".format(frame_id, s, j),
                             outputs[("color", frame_id, s)][j].data, self.step)
+                        writer.add_image(
+                            "color_gt_pred_{}_{}/{}".format(frame_id, s, j),
+                            gt_outputs[("color", frame_id, s)][j].data, self.step)
 
                 writer.add_image(
                     "disp_{}/{}".format(s, j),
